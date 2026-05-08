@@ -1,7 +1,27 @@
 
+import math
 import torch
 import torch.distributed as dist
 
+def _is_power_of(n: int, base: int) -> bool:
+    if n < 1:
+        return False
+    while n % base == 0:
+        n //= base
+    return n == 1
+
+
+def _ceil_log(n: int, base: int) -> int:
+    if n <= 1:
+        return 0
+    return math.ceil(math.log(n, base))
+
+
+def _swing_rho(step: int) -> int:
+    """
+    Swing rho(s) = sum_{i=0}^{s} (-2)^i = (1 - (-2)^(s+1)) / 3
+    """
+    return int((1 - ((-2) ** (step + 1))) // 3)
 
 def builtin_allreduce_sum_(x: torch.Tensor) -> torch.Tensor:
     """
@@ -92,6 +112,128 @@ def ring_allreduce_sum_(x: torch.Tensor) -> torch.Tensor:
     x.copy_(flat.view(original_shape))
     return x
 
+def swing_latency_allreduce_sum_(x: torch.Tensor) -> torch.Tensor:
+    """
+    Latency-optimal Swing AllReduce prototype.
+
+    Requirement:
+    - world_size must be a power of 2.
+
+    Paper logic:
+    - At step s, rank r communicates with pi(r, s).
+    - pi(r, s) = r + rho(s) mod p, if r is even
+               = r - rho(s) mod p, if r is odd
+    - rho(s) = sum_{i=0}^{s} (-2)^i
+    - The latency-optimal version exchanges the entire vector at each step.
+    """
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+
+    if world_size == 1:
+        return x
+
+    if not _is_power_of(world_size, 2):
+        raise ValueError(
+            f"Swing latency-optimal prototype currently requires "
+            f"world_size to be a power of 2, got world_size={world_size}."
+        )
+
+    steps = int(math.log2(world_size))
+
+    original_shape = x.shape
+    work = x.contiguous().view(-1)
+
+    recv_buf = torch.empty_like(work)
+
+    for step in range(steps):
+        rho = _swing_rho(step)
+
+        if rank % 2 == 0:
+            peer = (rank + rho) % world_size
+        else:
+            peer = (rank - rho) % world_size
+
+        send_buf = work.contiguous()
+
+        ops = [
+            dist.P2POp(dist.isend, send_buf, peer),
+            dist.P2POp(dist.irecv, recv_buf, peer),
+        ]
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+
+        work.add_(recv_buf)
+
+    x.copy_(work.view(original_shape))
+    return x
+
+
+def trivance_latency_allreduce_sum_(x: torch.Tensor) -> torch.Tensor:
+    """
+    Latency-optimal Trivance AllReduce prototype.
+
+    Requirement:
+    - world_size must be a power of 3.
+
+    Paper logic:
+    - At step k, rank r communicates with:
+        left  = r - 3^k mod n
+        right = r + 3^k mod n
+    - Each node uses both directions simultaneously.
+    """
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+
+    if world_size == 1:
+        return x
+
+    if not _is_power_of(world_size, 3):
+        raise ValueError(
+            f"Trivance latency-optimal prototype currently requires "
+            f"world_size to be a power of 3, got world_size={world_size}."
+        )
+
+    steps = int(round(math.log(world_size, 3)))
+
+    original_shape = x.shape
+    work = x.contiguous().view(-1)
+
+    recv_left = torch.empty_like(work)
+    recv_right = torch.empty_like(work)
+
+    for step in range(steps):
+        distance = 3 ** step
+
+        left_peer = (rank - distance) % world_size
+        right_peer = (rank + distance) % world_size
+
+        if left_peer == right_peer:
+            raise RuntimeError(
+                "Invalid Trivance peer selection: left_peer == right_peer. "
+                "This usually means world_size is too small or not a valid "
+                "power-of-three configuration."
+            )
+
+        send_left = work.contiguous()
+        send_right = work.contiguous()
+
+        ops = [
+            dist.P2POp(dist.isend, send_left, left_peer),
+            dist.P2POp(dist.irecv, recv_left, left_peer),
+            dist.P2POp(dist.isend, send_right, right_peer),
+            dist.P2POp(dist.irecv, recv_right, right_peer),
+        ]
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+
+        # Joint reduction from both incoming communications.
+        work.add_(recv_left)
+        work.add_(recv_right)
+
+    x.copy_(work.view(original_shape))
+    return x
 
 def allreduce_sum_(x: torch.Tensor, algo: str) -> torch.Tensor:
     """
@@ -101,5 +243,9 @@ def allreduce_sum_(x: torch.Tensor, algo: str) -> torch.Tensor:
         return builtin_allreduce_sum_(x)
     elif algo == "ring":
         return ring_allreduce_sum_(x)
+    elif algo == "swing-latency":
+        return swing_latency_allreduce_sum_(x)
+    elif algo == "trivance-latency":
+        return trivance_latency_allreduce_sum_(x)
     else:
         raise ValueError(f"Unknown all-reduce algorithm: {algo}")
