@@ -45,16 +45,6 @@ custom_allreduce.py
 
 Contains custom all-reduce implementations.
 
-Currently implemented:
-
-- `builtin_allreduce_sum_`
-- `ring_allreduce_sum_`
-
-Future algorithms:
-
-- `trivance_allreduce_sum_`
-- `swing_allreduce_sum_`
-
 ```text
 train_cpu_ddp_custom.py
 ```
@@ -63,27 +53,196 @@ A small PyTorch DDP training script.
 
 It trains a synthetic MLP model and replaces DDP's default gradient synchronization with a custom communication hook.
 
-## How to Run
+## Run & Test Commands
 
-Basic command:
+### Test Built-in AllReduce
 
 ```bash
-torchrun --standalone --nproc_per_node=2 train_cpu_ddp_custom.py \
-  --algo ring \
-  --steps 50 \
-  --batch-size 128 \
-  --threads 4
+GLOO_SOCKET_IFNAME=lo PYTHONUNBUFFERED=1 OMP_NUM_THREADS=2 \
+torchrun --nnodes=1 --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29501 \
+train_cpu_ddp_custom.py \
+  --algo builtin \
+  --steps 20 \
+  --batch-size 32 \
+  --hidden-dim 128 \
+  --num-layers 2 \
+  --bucket-cap-mb 1 \
+  --threads 2
 ```
 
-Recommended command for single-machine CPU testing:
+### Test Ring
 
 ```bash
-GLOO_SOCKET_IFNAME=lo PYTHONUNBUFFERED=1 OMP_NUM_THREADS=4 \
-torchrun --standalone --nproc_per_node=2 train_cpu_ddp_custom.py \
+GLOO_SOCKET_IFNAME=lo PYTHONUNBUFFERED=1 OMP_NUM_THREADS=2 \
+torchrun --nnodes=1 --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29502 \
+train_cpu_ddp_custom.py \
   --algo ring \
-  --steps 50 \
-  --batch-size 128 \
-  --threads 4
+  --steps 20 \
+  --batch-size 32 \
+  --hidden-dim 128 \
+  --num-layers 2 \
+  --bucket-cap-mb 1 \
+  --threads 2
+```
+
+### Test Recursive Doubling
+
+Recursive Doubling currently requires:
+
+```text
+world_size = 2^k
+```
+
+For example, use 4 ranks.
+
+#### Recursive Doubling Latency Version
+
+```bash
+GLOO_SOCKET_IFNAME=lo PYTHONUNBUFFERED=1 OMP_NUM_THREADS=2 \
+torchrun --nnodes=1 --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29503 \
+train_cpu_ddp_custom.py \
+  --algo recursive-doubling-latency \
+  --steps 20 \
+  --batch-size 32 \
+  --hidden-dim 128 \
+  --num-layers 2 \
+  --bucket-cap-mb 1 \
+  --threads 2
+```
+
+#### Recursive Doubling Bandwidth Version
+
+```bash
+GLOO_SOCKET_IFNAME=lo PYTHONUNBUFFERED=1 OMP_NUM_THREADS=2 \
+torchrun --nnodes=1 --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29504 \
+train_cpu_ddp_custom.py \
+  --algo recursive-doubling-bandwidth \
+  --steps 20 \
+  --batch-size 32 \
+  --hidden-dim 128 \
+  --num-layers 2 \
+  --bucket-cap-mb 1 \
+  --threads 2
+```
+
+### Test Swing
+
+Swing currently requires:
+
+```text
+world_size = 2^k
+```
+
+For example, use 4 or 8 ranks.
+
+#### Swing Latency Version
+
+```bash
+GLOO_SOCKET_IFNAME=lo PYTHONUNBUFFERED=1 OMP_NUM_THREADS=2 \
+torchrun --nnodes=1 --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29505 \
+train_cpu_ddp_custom.py \
+  --algo swing-latency \
+  --steps 20 \
+  --batch-size 32 \
+  --hidden-dim 128 \
+  --num-layers 2 \
+  --bucket-cap-mb 1 \
+  --threads 2
+```
+
+#### Swing Bandwidth Version
+
+```bash
+GLOO_SOCKET_IFNAME=lo PYTHONUNBUFFERED=1 OMP_NUM_THREADS=2 \
+torchrun --nnodes=1 --nproc_per_node=4 --master_addr=127.0.0.1 --master_port=29506 \
+train_cpu_ddp_custom.py \
+  --algo swing-bandwidth \
+  --steps 20 \
+  --batch-size 32 \
+  --hidden-dim 128 \
+  --num-layers 2 \
+  --bucket-cap-mb 1 \
+  --threads 2
+```
+
+### Test Trivance
+
+Trivance currently requires:
+
+```text
+world_size = 3^k
+```
+
+For example, use 3 or 9 ranks.
+
+#### Trivance Latency Version
+
+```bash
+GLOO_SOCKET_IFNAME=lo PYTHONUNBUFFERED=1 OMP_NUM_THREADS=1 \
+torchrun --nnodes=1 --nproc_per_node=9 --master_addr=127.0.0.1 --master_port=29507 \
+train_cpu_ddp_custom.py \
+  --algo trivance-latency \
+  --steps 20 \
+  --batch-size 16 \
+  --hidden-dim 64 \
+  --num-layers 2 \
+  --bucket-cap-mb 1 \
+  --threads 1
+```
+
+#### Trivance Bandwidth Version
+
+```bash
+GLOO_SOCKET_IFNAME=lo PYTHONUNBUFFERED=1 OMP_NUM_THREADS=1 \
+torchrun --nnodes=1 --nproc_per_node=9 --master_addr=127.0.0.1 --master_port=29508 \
+train_cpu_ddp_custom.py \
+  --algo trivance-bandwidth \
+  --steps 20 \
+  --batch-size 16 \
+  --hidden-dim 64 \
+  --num-layers 2 \
+  --bucket-cap-mb 1 \
+  --threads 1
+```
+
+### Test Bruck
+
+Bruck currently requires:
+
+```text
+world_size = 3^k
+```
+
+For example, use 3 or 9 ranks.
+
+#### Bruck Latency Version
+
+```bash
+GLOO_SOCKET_IFNAME=lo PYTHONUNBUFFERED=1 OMP_NUM_THREADS=1 \
+torchrun --nnodes=1 --nproc_per_node=9 --master_addr=127.0.0.1 --master_port=29509 \
+train_cpu_ddp_custom.py \
+  --algo bruck-latency \
+  --steps 20 \
+  --batch-size 16 \
+  --hidden-dim 64 \
+  --num-layers 2 \
+  --bucket-cap-mb 1 \
+  --threads 1
+```
+
+#### Bruck Bandwidth Version
+
+```bash
+GLOO_SOCKET_IFNAME=lo PYTHONUNBUFFERED=1 OMP_NUM_THREADS=1 \
+torchrun --nnodes=1 --nproc_per_node=9 --master_addr=127.0.0.1 --master_port=29510 \
+train_cpu_ddp_custom.py \
+  --algo bruck-bandwidth \
+  --steps 20 \
+  --batch-size 16 \
+  --hidden-dim 64 \
+  --num-layers 2 \
+  --bucket-cap-mb 1 \
+  --threads 1
 ```
 
 If the script runs correctly, the output should include fields such as:
@@ -114,16 +273,14 @@ Available options:
 ```text
 builtin
 ring
-```
-
-- `builtin`: uses PyTorch/Gloo built-in all-reduce
-- `ring`: uses the custom Ring AllReduce implementation
-
-Future options may include:
-
-```text
-trivance
-swing
+recursive-doubling-latency
+recursive-doubling-bandwidth
+swing-latency
+swing-bandwidth
+bruck-latency
+bruck-bandwidth
+trivance-latency
+trivance-bandwidth
 ```
 
 ### `--steps`
@@ -270,7 +427,5 @@ It does not yet prove GPU/NCCL performance. Future work will extend this prototy
 
 ## Future Work
 
-- Implement Trivance in Python
-- Implement Swing in Python
 - Extend to GPU/NCCL-based distributed training
 - Compare custom algorithms with NCCL all-reduce on GPU clusters
