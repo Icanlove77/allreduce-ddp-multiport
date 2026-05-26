@@ -118,7 +118,23 @@ def check_parameter_consistency(model: nn.Module, rank: int, world_size: int):
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--algo", type=str, default="ring", choices=["builtin", "ring", "swing-latency", "trivance-latency"])
+    parser.add_argument(
+        "--algo",
+        type=str,
+        default="ring",
+        choices=[
+            "builtin",
+            "ring",
+            "recursive-doubling-latency",
+            "recursive-doubling-bandwidth",
+            "swing-latency",
+            "swing-bandwidth",
+            "bruck-latency",
+            "bruck-bandwidth",
+            "trivance-latency",
+            "trivance-bandwidth",
+        ],
+    )
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--input-dim", type=int, default=512)
