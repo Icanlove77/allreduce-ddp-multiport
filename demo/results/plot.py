@@ -4,15 +4,13 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 
-CSV_PATH = Path("training_completion_results.csv")
+CSV_PATH = Path("9nodes_5times_cpu.csv")
 
 # All algorithms now run with the same world_size=9, so no normalization is needed.
 METRIC = "avg_step_time_ms"
 
-OUT_AVG_FIG = Path("relative_completion_mean.pdf")
-OUT_FAV_FIG = Path("relative_completion_best.pdf")
-OUT_SUMMARY = Path("plot_summaries.csv")
-
+OUT_AVG_FIG = Path("9nodes_5times_cpu_relative_completion_mean.pdf")
+OUT_FAV_FIG = Path("9nodes_5times_cpu_relative_completion_best.pdf")
 
 families = {
     "BuiltIn": ["builtin"],
@@ -484,19 +482,8 @@ def main():
         "",
     )
 
-    combined = pd.concat(
-        [
-            avg_summary.assign(plot_type="mean_of_runs"),
-            fav_summary.assign(plot_type="trivance_best"),
-        ],
-        ignore_index=True,
-    )
-
-    combined.to_csv(OUT_SUMMARY, index=False)
-
     print(f"Saved: {OUT_AVG_FIG}")
     print(f"Saved: {OUT_FAV_FIG}")
-    print(f"Saved: {OUT_SUMMARY}")
 
     print("\nTransition points based on run means:")
     for family, idx in transition_points.items():
