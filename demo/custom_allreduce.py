@@ -169,6 +169,538 @@ def _copy_packed_to_chunks(chunks, indices, packed):
     for row, idx in enumerate(indices):
         chunks[idx].copy_(rows[row])
 
+def _largest_power_of_two_leq(n: int) -> int:
+    """
+    Return the largest power of two <= n.
+    """
+    if n < 1:
+        raise ValueError(f"n must be positive, got {n}")
+    return 1 << (n.bit_length() - 1)
+
+
+def _power2_active_info(rank: int, world_size: int):
+    """
+    Non-power-of-two folding information.
+
+    Let p2 = largest power of two <= world_size
+    and r = world_size - p2.
+
+    The first 2r ranks are paired:
+        even ranks: active
+        odd ranks: eliminated temporarily
+
+    Remaining ranks [2r, world_size) are active.
+
+    Example for world_size=9:
+        p2 = 8, r = 1
+        rank 0 active, rank 1 eliminated
+        active ranks = [0, 2, 3, 4, 5, 6, 7, 8]
+    """
+    p2 = _largest_power_of_two_leq(world_size)
+    r = world_size - p2
+
+    if r == 0:
+        return {
+            "p2": p2,
+            "r": r,
+            "is_power_of_two": True,
+            "is_active": True,
+            "is_eliminated": False,
+            "partner": None,
+            "active_ranks": list(range(world_size)),
+            "local_rank": rank,
+        }
+
+    active_ranks = list(range(0, 2 * r, 2)) + list(range(2 * r, world_size))
+
+    if rank < 2 * r:
+        if rank % 2 == 0:
+            local_rank = rank // 2
+            return {
+                "p2": p2,
+                "r": r,
+                "is_power_of_two": False,
+                "is_active": True,
+                "is_eliminated": False,
+                "partner": rank + 1,
+                "active_ranks": active_ranks,
+                "local_rank": local_rank,
+            }
+        else:
+            return {
+                "p2": p2,
+                "r": r,
+                "is_power_of_two": False,
+                "is_active": False,
+                "is_eliminated": True,
+                "partner": rank - 1,
+                "active_ranks": active_ranks,
+                "local_rank": None,
+            }
+
+    local_rank = rank - r
+    return {
+        "p2": p2,
+        "r": r,
+        "is_power_of_two": False,
+        "is_active": True,
+        "is_eliminated": False,
+        "partner": None,
+        "active_ranks": active_ranks,
+        "local_rank": local_rank,
+    }
+
+
+def _prepare_even_work_buffer(x: torch.Tensor):
+    """
+    Flatten x and pad it to an even number of elements.
+
+    This is used by half-vector folding. The extra padded value, if any,
+    is zero and will be removed before copying the result back to x.
+    """
+    original_shape = x.shape
+    flat = x.contiguous().view(-1)
+    original_numel = flat.numel()
+
+    if original_numel % 2 != 0:
+        padding = torch.zeros(
+            1,
+            dtype=flat.dtype,
+            device=flat.device,
+        )
+        work = torch.cat([flat, padding], dim=0)
+    else:
+        work = flat
+
+    return original_shape, flat, original_numel, work
+
+
+def _finish_even_work_buffer(
+    x: torch.Tensor,
+    original_shape,
+    flat: torch.Tensor,
+    original_numel: int,
+    work: torch.Tensor,
+):
+    """
+    Remove padding introduced by _prepare_even_work_buffer and copy result back.
+    """
+    if work.data_ptr() != flat.data_ptr():
+        flat.copy_(work[:original_numel])
+
+    x.copy_(flat.view(original_shape))
+    return x
+
+
+def _inner_recursive_doubling_latency_active_(
+    work: torch.Tensor,
+    active_ranks,
+    local_rank: int,
+):
+    """
+    Recursive Doubling latency version on a power-of-two active group.
+
+    active_ranks maps local active rank -> global rank.
+    """
+    active_size = len(active_ranks)
+
+    if not _is_power_of(active_size, 2):
+        raise RuntimeError("active_size must be a power of two.")
+
+    steps = _log_power(active_size, 2)
+    recv_buf = torch.empty_like(work)
+
+    for step in range(steps):
+        peer_local = local_rank ^ (1 << step)
+        peer_global = active_ranks[peer_local]
+
+        send_buf = work.contiguous()
+
+        ops = [
+            dist.P2POp(dist.isend, send_buf, peer_global),
+            dist.P2POp(dist.irecv, recv_buf, peer_global),
+        ]
+
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+
+        work.add_(recv_buf)
+
+    return work
+
+
+def _inner_swing_latency_active_(
+    work: torch.Tensor,
+    active_ranks,
+    local_rank: int,
+):
+    """
+    Swing latency version on a power-of-two active group.
+
+    The Swing peer is computed in the local active-rank space and then
+    mapped back to global rank IDs.
+    """
+    active_size = len(active_ranks)
+
+    if not _is_power_of(active_size, 2):
+        raise RuntimeError("active_size must be a power of two.")
+
+    steps = _log_power(active_size, 2)
+    recv_buf = torch.empty_like(work)
+
+    for step in range(steps):
+        peer_local = _swing_peer(local_rank, step, active_size)
+        peer_global = active_ranks[peer_local]
+
+        send_buf = work.contiguous()
+
+        ops = [
+            dist.P2POp(dist.isend, send_buf, peer_global),
+            dist.P2POp(dist.irecv, recv_buf, peer_global),
+        ]
+
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+
+        work.add_(recv_buf)
+
+    return work
+
+
+def _inner_recursive_doubling_bandwidth_active_(
+    x: torch.Tensor,
+    active_ranks,
+    local_rank: int,
+):
+    """
+    Recursive Doubling bandwidth version on a power-of-two active group.
+
+    This is the same reduce-scatter + allgather logic as the original
+    power-of-two version, but peer IDs are mapped through active_ranks.
+    """
+    active_size = len(active_ranks)
+
+    if not _is_power_of(active_size, 2):
+        raise RuntimeError("active_size must be a power of two.")
+
+    steps = _log_power(active_size, 2)
+
+    original_shape, flat, original_numel, work, chunks = _prepare_work_buffer(
+        x, active_size
+    )
+
+    active = list(range(active_size))
+
+    # Phase 1: Reduce-Scatter
+    for step in range(steps):
+        bit = 1 << step
+        peer_local = local_rank ^ bit
+        peer_global = active_ranks[peer_local]
+
+        keep_indices = [
+            idx for idx in active
+            if ((idx >> step) & 1) == ((local_rank >> step) & 1)
+        ]
+        send_indices = [
+            idx for idx in active
+            if ((idx >> step) & 1) != ((local_rank >> step) & 1)
+        ]
+
+        send_buf = _pack_chunks(chunks, send_indices)
+        recv_buf = _recv_buffer_like(chunks, keep_indices)
+
+        ops = [
+            dist.P2POp(dist.isend, send_buf, peer_global),
+            dist.P2POp(dist.irecv, recv_buf, peer_global),
+        ]
+
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+
+        _add_packed_to_chunks(chunks, keep_indices, recv_buf)
+        active = sorted(keep_indices)
+
+    # Phase 2: AllGather
+    for step in reversed(range(steps)):
+        bit = 1 << step
+        peer_local = local_rank ^ bit
+        peer_global = active_ranks[peer_local]
+
+        send_indices = sorted(active)
+        recv_indices = sorted([idx ^ bit for idx in active])
+
+        send_buf = _pack_chunks(chunks, send_indices)
+        recv_buf = _recv_buffer_like(chunks, recv_indices)
+
+        ops = [
+            dist.P2POp(dist.isend, send_buf, peer_global),
+            dist.P2POp(dist.irecv, recv_buf, peer_global),
+        ]
+
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+
+        _copy_packed_to_chunks(chunks, recv_indices, recv_buf)
+        active = sorted(set(active).union(recv_indices))
+
+    return _finish_work_buffer(x, original_shape, flat, original_numel, work)
+
+
+def _inner_swing_bandwidth_active_(
+    x: torch.Tensor,
+    active_ranks,
+    local_rank: int,
+):
+    """
+    Swing bandwidth version on a power-of-two active group.
+
+    The block indices are computed in local active-rank space.
+    P2P peers are mapped back to global rank IDs through active_ranks.
+    """
+    active_size = len(active_ranks)
+
+    if not _is_power_of(active_size, 2):
+        raise RuntimeError("active_size must be a power of two.")
+
+    steps = _log_power(active_size, 2)
+
+    original_shape, flat, original_numel, work, chunks = _prepare_work_buffer(
+        x, active_size
+    )
+
+    # Phase 1: Reduce-Scatter
+    for step in range(steps):
+        peer_local = _swing_peer(local_rank, step, active_size)
+        peer_global = active_ranks[peer_local]
+
+        send_indices = _swing_subtree_indices(
+            root=peer_local,
+            next_step=step + 1,
+            world_size=active_size,
+            total_steps=steps,
+        )
+        recv_indices = _swing_subtree_indices(
+            root=local_rank,
+            next_step=step + 1,
+            world_size=active_size,
+            total_steps=steps,
+        )
+
+        send_buf = _pack_chunks(chunks, send_indices)
+        recv_buf = _recv_buffer_like(chunks, recv_indices)
+
+        ops = [
+            dist.P2POp(dist.isend, send_buf, peer_global),
+            dist.P2POp(dist.irecv, recv_buf, peer_global),
+        ]
+
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+
+        _add_packed_to_chunks(chunks, recv_indices, recv_buf)
+
+    # Phase 2: AllGather
+    for step in reversed(range(steps)):
+        peer_local = _swing_peer(local_rank, step, active_size)
+        peer_global = active_ranks[peer_local]
+
+        send_indices = _swing_subtree_indices(
+            root=local_rank,
+            next_step=step + 1,
+            world_size=active_size,
+            total_steps=steps,
+        )
+        recv_indices = _swing_subtree_indices(
+            root=peer_local,
+            next_step=step + 1,
+            world_size=active_size,
+            total_steps=steps,
+        )
+
+        send_buf = _pack_chunks(chunks, send_indices)
+        recv_buf = _recv_buffer_like(chunks, recv_indices)
+
+        ops = [
+            dist.P2POp(dist.isend, send_buf, peer_global),
+            dist.P2POp(dist.irecv, recv_buf, peer_global),
+        ]
+
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+
+        _copy_packed_to_chunks(chunks, recv_indices, recv_buf)
+
+    return _finish_work_buffer(x, original_shape, flat, original_numel, work)
+
+
+def _fold_full_buffer_then_run_active_(
+    x: torch.Tensor,
+    info,
+    inner_func,
+):
+    """
+    Non-power-of-two latency-style folding.
+
+    Eliminated odd ranks send the full buffer to their even partner.
+    Active ranks run a power-of-two algorithm.
+    The partner sends the final result back to the eliminated rank.
+    """
+    original_shape = x.shape
+    work = x.contiguous().view(-1)
+
+    if info["is_power_of_two"]:
+        inner_func(work, info["active_ranks"], info["local_rank"])
+        x.copy_(work.view(original_shape))
+        return x
+
+    partner = info["partner"]
+
+    if info["is_eliminated"]:
+        send_buf = work.contiguous()
+
+        send_req = dist.isend(send_buf, partner)
+        send_req.wait()
+
+        final_buf = torch.empty_like(work)
+        recv_req = dist.irecv(final_buf, partner)
+        recv_req.wait()
+
+        work.copy_(final_buf)
+        x.copy_(work.view(original_shape))
+        return x
+
+    # Active paired rank receives and reduces the eliminated partner.
+    if partner is not None:
+        recv_buf = torch.empty_like(work)
+        recv_req = dist.irecv(recv_buf, partner)
+        recv_req.wait()
+        work.add_(recv_buf)
+
+    # Active power-of-two algorithm.
+    inner_func(work, info["active_ranks"], info["local_rank"])
+
+    # Send final result back to eliminated partner.
+    if partner is not None:
+        send_buf = work.contiguous()
+        send_req = dist.isend(send_buf, partner)
+        send_req.wait()
+
+    x.copy_(work.view(original_shape))
+    return x
+
+
+def _fold_half_vector_then_run_active_(
+    x: torch.Tensor,
+    info,
+    inner_func,
+):
+    """
+    Non-power-of-two bandwidth-style half-vector folding.
+
+    For each extra pair:
+        even active rank sends second half to odd eliminated rank;
+        odd eliminated rank sends first half to even active rank;
+        both reduce the half they receive;
+        odd sends the reduced second half back to even;
+        even now has the full reduced vector for both ranks.
+
+    Then active ranks run a power-of-two bandwidth algorithm.
+    Finally, the even active rank sends the final result back to its
+    eliminated odd partner.
+    """
+    original_shape, flat, original_numel, work = _prepare_even_work_buffer(x)
+
+    if info["is_power_of_two"]:
+        inner_func(work, info["active_ranks"], info["local_rank"])
+        return _finish_even_work_buffer(
+            x, original_shape, flat, original_numel, work
+        )
+
+    partner = info["partner"]
+    half = work.numel() // 2
+
+    first_half = work[:half]
+    second_half = work[half:]
+
+    if info["is_eliminated"]:
+        # Odd eliminated rank:
+        # send first half to active even partner;
+        # receive second half from active even partner;
+        # reduce second half locally;
+        # send reduced second half back;
+        # wait for final full result.
+        send_first = first_half.contiguous()
+        recv_second = torch.empty_like(second_half)
+
+        ops = [
+            dist.P2POp(dist.isend, send_first, partner),
+            dist.P2POp(dist.irecv, recv_second, partner),
+        ]
+
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+
+        second_half.add_(recv_second)
+
+        send_reduced_second = second_half.contiguous()
+        send_req = dist.isend(send_reduced_second, partner)
+        send_req.wait()
+
+        final_buf = torch.empty_like(work)
+        recv_req = dist.irecv(final_buf, partner)
+        recv_req.wait()
+
+        work.copy_(final_buf)
+
+        return _finish_even_work_buffer(
+            x, original_shape, flat, original_numel, work
+        )
+
+    # Active paired even rank.
+    if partner is not None:
+        # send second half to eliminated odd partner;
+        # receive first half from eliminated odd partner;
+        # reduce first half locally;
+        # receive reduced second half back.
+        send_second = second_half.contiguous()
+        recv_first = torch.empty_like(first_half)
+
+        ops = [
+            dist.P2POp(dist.isend, send_second, partner),
+            dist.P2POp(dist.irecv, recv_first, partner),
+        ]
+
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+
+        first_half.add_(recv_first)
+
+        recv_reduced_second = torch.empty_like(second_half)
+        recv_req = dist.irecv(recv_reduced_second, partner)
+        recv_req.wait()
+
+        second_half.copy_(recv_reduced_second)
+
+    # Active power-of-two algorithm.
+    inner_func(work, info["active_ranks"], info["local_rank"])
+
+    # Send final result back to eliminated odd partner.
+    if partner is not None:
+        send_buf = work.contiguous()
+        send_req = dist.isend(send_buf, partner)
+        send_req.wait()
+
+    return _finish_even_work_buffer(
+        x, original_shape, flat, original_numel, work
+    )
 
 def _swing_subtree_indices(
     root: int,
@@ -334,15 +866,17 @@ def ring_allreduce_sum_(x: torch.Tensor) -> torch.Tensor:
 
 def recursive_doubling_latency_allreduce_sum_(x: torch.Tensor) -> torch.Tensor:
     """
-    Latency-optimal Recursive Doubling AllReduce.
+    Recursive Doubling latency AllReduce.
 
-    Requirement:
-    - world_size must be a power of 2.
+    Supports:
+    - power-of-two world_size: normal recursive doubling.
+    - non-power-of-two world_size: full-buffer folding to the nearest
+      lower power-of-two active group.
 
-    Logic:
-    - At step k, rank r exchanges the whole buffer with r XOR 2^k.
-    - After receiving, it adds the received buffer to the local buffer.
-    - Total steps: log2(world_size).
+    For world_size=9:
+        rank 1 is folded into rank 0;
+        active ranks [0,2,3,4,5,6,7,8] run 8-rank RD;
+        rank 0 sends the final result back to rank 1.
     """
     world_size = dist.get_world_size()
     rank = dist.get_rank()
@@ -350,48 +884,29 @@ def recursive_doubling_latency_allreduce_sum_(x: torch.Tensor) -> torch.Tensor:
     if world_size == 1:
         return x
 
-    if not _is_power_of(world_size, 2):
-        raise ValueError(
-            f"Recursive Doubling latency version requires world_size=2^k, "
-            f"got world_size={world_size}."
-        )
+    info = _power2_active_info(rank, world_size)
 
-    steps = _log_power(world_size, 2)
-
-    original_shape = x.shape
-    work = x.contiguous().view(-1)
-    recv_buf = torch.empty_like(work)
-
-    for step in range(steps):
-        peer = rank ^ (1 << step)
-
-        send_buf = work.contiguous()
-
-        ops = [
-            dist.P2POp(dist.isend, send_buf, peer),
-            dist.P2POp(dist.irecv, recv_buf, peer),
-        ]
-        reqs = dist.batch_isend_irecv(ops)
-        for req in reqs:
-            req.wait()
-
-        work.add_(recv_buf)
-
-    x.copy_(work.view(original_shape))
-    return x
+    return _fold_full_buffer_then_run_active_(
+        x,
+        info,
+        _inner_recursive_doubling_latency_active_,
+    )
 
 
 def recursive_doubling_bandwidth_allreduce_sum_(x: torch.Tensor) -> torch.Tensor:
     """
-    Bandwidth-optimal Recursive Doubling.
+    Recursive Doubling / Rabenseifner-style bandwidth AllReduce.
 
-    Requirement:
-    - world_size must be a power of 2.
+    Supports:
+    - power-of-two world_size: normal reduce-scatter + allgather.
+    - non-power-of-two world_size: half-vector folding to the nearest
+      lower power-of-two active group.
 
-    Structure:
-    - Reduce-Scatter: recursively halves the active block set.
-    - AllGather: reverse order, recursively doubles the active block set.
-
+    For world_size=9:
+        rank 0 and rank 1 first exchange half vectors;
+        rank 1 is temporarily eliminated;
+        active ranks [0,2,3,4,5,6,7,8] run 8-rank bandwidth RD;
+        rank 0 sends the final result back to rank 1.
     """
     world_size = dist.get_world_size()
     rank = dist.get_rank()
@@ -399,85 +914,28 @@ def recursive_doubling_bandwidth_allreduce_sum_(x: torch.Tensor) -> torch.Tensor
     if world_size == 1:
         return x
 
-    if not _is_power_of(world_size, 2):
-        raise ValueError(
-            f"Recursive Doubling bandwidth version requires world_size=2^k, "
-            f"got world_size={world_size}."
-        )
+    info = _power2_active_info(rank, world_size)
 
-    steps = _log_power(world_size, 2)
-
-    original_shape, flat, original_numel, work, chunks = _prepare_work_buffer(
-        x, world_size
+    return _fold_half_vector_then_run_active_(
+        x,
+        info,
+        _inner_recursive_doubling_bandwidth_active_,
     )
-
-    active = list(range(world_size))
-
-    # Phase 1: Reduce-Scatter.
-    # Step k keeps blocks whose k-th bit matches rank's k-th bit.
-    for step in range(steps):
-        bit = 1 << step
-        peer = rank ^ bit
-
-        keep_indices = [
-            idx for idx in active
-            if ((idx >> step) & 1) == ((rank >> step) & 1)
-        ]
-        send_indices = [
-            idx for idx in active
-            if ((idx >> step) & 1) != ((rank >> step) & 1)
-        ]
-
-        send_buf = _pack_chunks(chunks, send_indices)
-        recv_buf = _recv_buffer_like(chunks, keep_indices)
-
-        ops = [
-            dist.P2POp(dist.isend, send_buf, peer),
-            dist.P2POp(dist.irecv, recv_buf, peer),
-        ]
-        reqs = dist.batch_isend_irecv(ops)
-        for req in reqs:
-            req.wait()
-
-        _add_packed_to_chunks(chunks, keep_indices, recv_buf)
-        active = sorted(keep_indices)
-
-    # Phase 2: AllGather.
-    # Reverse the reduce-scatter communication.
-    for step in reversed(range(steps)):
-        bit = 1 << step
-        peer = rank ^ bit
-
-        send_indices = sorted(active)
-        recv_indices = sorted([idx ^ bit for idx in active])
-
-        send_buf = _pack_chunks(chunks, send_indices)
-        recv_buf = _recv_buffer_like(chunks, recv_indices)
-
-        ops = [
-            dist.P2POp(dist.isend, send_buf, peer),
-            dist.P2POp(dist.irecv, recv_buf, peer),
-        ]
-        reqs = dist.batch_isend_irecv(ops)
-        for req in reqs:
-            req.wait()
-
-        _copy_packed_to_chunks(chunks, recv_indices, recv_buf)
-        active = sorted(set(active).union(recv_indices))
-
-    return _finish_work_buffer(x, original_shape, flat, original_numel, work)
 
 
 def swing_latency_allreduce_sum_(x: torch.Tensor) -> torch.Tensor:
     """
-    Latency-optimal Swing AllReduce.
+    Swing latency AllReduce.
 
-    Requirement:
-    - world_size must be a power of 2.
+    Supports:
+    - power-of-two world_size: normal Swing.
+    - non-power-of-two world_size: full-buffer folding to the nearest
+      lower power-of-two active group.
 
-    Logic:
-    - At step s, rank r communicates with pi(r, s).
-    - This latency version exchanges the entire vector at each step.
+    Note:
+    This is a functional non-power-of-two adaptation. For world_size=9,
+    it folds one extra rank and runs the original Swing schedule on 8
+    active ranks.
     """
     world_size = dist.get_world_size()
     rank = dist.get_rank()
@@ -485,50 +943,29 @@ def swing_latency_allreduce_sum_(x: torch.Tensor) -> torch.Tensor:
     if world_size == 1:
         return x
 
-    if not _is_power_of(world_size, 2):
-        raise ValueError(
-            f"Swing latency version requires world_size=2^k, "
-            f"got world_size={world_size}."
-        )
+    info = _power2_active_info(rank, world_size)
 
-    steps = _log_power(world_size, 2)
-
-    original_shape = x.shape
-    work = x.contiguous().view(-1)
-    recv_buf = torch.empty_like(work)
-
-    for step in range(steps):
-        peer = _swing_peer(rank, step, world_size)
-        send_buf = work.contiguous()
-
-        ops = [
-            dist.P2POp(dist.isend, send_buf, peer),
-            dist.P2POp(dist.irecv, recv_buf, peer),
-        ]
-        reqs = dist.batch_isend_irecv(ops)
-        for req in reqs:
-            req.wait()
-
-        work.add_(recv_buf)
-
-    x.copy_(work.view(original_shape))
-    return x
+    return _fold_full_buffer_then_run_active_(
+        x,
+        info,
+        _inner_swing_latency_active_,
+    )
 
 
 def swing_bandwidth_allreduce_sum_(x: torch.Tensor) -> torch.Tensor:
     """
-    Bandwidth-optimal Swing AllReduce.
+    Swing bandwidth AllReduce.
 
-    Requirement:
-    - world_size must be a power of 2.
+    Supports:
+    - power-of-two world_size: normal Swing-B.
+    - non-power-of-two world_size: half-vector folding to the nearest
+      lower power-of-two active group, then Swing-B on active ranks.
 
-    Structure:
-    - Reduce-Scatter with Swing peer selection.
-    - AllGather in reverse order.
-
-    Note:
-    - This version packs non-contiguous block sets using torch.cat().
-    - It is for correctness instead of high performance.
+    For world_size=9:
+        rank 0 and rank 1 first exchange half vectors;
+        rank 1 is temporarily eliminated;
+        active ranks [0,2,3,4,5,6,7,8] run 8-rank Swing-B;
+        rank 0 sends the final result back to rank 1.
     """
     world_size = dist.get_world_size()
     rank = dist.get_rank()
@@ -536,79 +973,13 @@ def swing_bandwidth_allreduce_sum_(x: torch.Tensor) -> torch.Tensor:
     if world_size == 1:
         return x
 
-    if not _is_power_of(world_size, 2):
-        raise ValueError(
-            f"Swing bandwidth version requires world_size=2^k, "
-            f"got world_size={world_size}."
-        )
+    info = _power2_active_info(rank, world_size)
 
-    steps = _log_power(world_size, 2)
-
-    original_shape, flat, original_numel, work, chunks = _prepare_work_buffer(
-        x, world_size
+    return _fold_half_vector_then_run_active_(
+        x,
+        info,
+        _inner_swing_bandwidth_active_,
     )
-
-    # Phase 1: Reduce-Scatter.
-    for step in range(steps):
-        peer = _swing_peer(rank, step, world_size)
-
-        send_indices = _swing_subtree_indices(
-            root=peer,
-            next_step=step + 1,
-            world_size=world_size,
-            total_steps=steps,
-        )
-        recv_indices = _swing_subtree_indices(
-            root=rank,
-            next_step=step + 1,
-            world_size=world_size,
-            total_steps=steps,
-        )
-
-        send_buf = _pack_chunks(chunks, send_indices)
-        recv_buf = _recv_buffer_like(chunks, recv_indices)
-
-        ops = [
-            dist.P2POp(dist.isend, send_buf, peer),
-            dist.P2POp(dist.irecv, recv_buf, peer),
-        ]
-        reqs = dist.batch_isend_irecv(ops)
-        for req in reqs:
-            req.wait()
-
-        _add_packed_to_chunks(chunks, recv_indices, recv_buf)
-
-    # Phase 2: AllGather.
-    for step in reversed(range(steps)):
-        peer = _swing_peer(rank, step, world_size)
-
-        send_indices = _swing_subtree_indices(
-            root=rank,
-            next_step=step + 1,
-            world_size=world_size,
-            total_steps=steps,
-        )
-        recv_indices = _swing_subtree_indices(
-            root=peer,
-            next_step=step + 1,
-            world_size=world_size,
-            total_steps=steps,
-        )
-
-        send_buf = _pack_chunks(chunks, send_indices)
-        recv_buf = _recv_buffer_like(chunks, recv_indices)
-
-        ops = [
-            dist.P2POp(dist.isend, send_buf, peer),
-            dist.P2POp(dist.irecv, recv_buf, peer),
-        ]
-        reqs = dist.batch_isend_irecv(ops)
-        for req in reqs:
-            req.wait()
-
-        _copy_packed_to_chunks(chunks, recv_indices, recv_buf)
-
-    return _finish_work_buffer(x, original_shape, flat, original_numel, work)
 
 
 def bruck_latency_allreduce_sum_(x: torch.Tensor) -> torch.Tensor:

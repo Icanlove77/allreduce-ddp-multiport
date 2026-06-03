@@ -16,7 +16,6 @@ THREADS=1
 # This makes the gradient communication size roughly equal to model parameter size.
 BUCKET_CAP_MB=512
 
-# Repeat each setting several times. You can start with 1 for debugging.
 REPEATS=5
 
 # Model sizes from small to large.
@@ -31,37 +30,28 @@ MODEL_CONFIGS=(
   "1024 4 h1024_l4"
 )
 
-# Larger configs may be slow on CPU. Uncomment later if needed.
 # MODEL_CONFIGS+=(
 #   "2048 2 h2048_l2"
 # )
 
-# 9-rank algorithms.
-# Ring can run with arbitrary world_size, so we put it in the 9-rank group.
+# All algorithms now run with 9 ranks.
+# RD and Swing should already support non-power-of-two world_size after the 9-rank adaptation.
 ALGOS_9=(
+  "builtin"
   "ring"
+  "recursive-doubling-latency"
+  "recursive-doubling-bandwidth"
+  "swing-latency"
+  "swing-bandwidth"
   "bruck-latency"
   "bruck-bandwidth"
   "trivance-latency"
   "trivance-bandwidth"
 )
 
-# 8-rank algorithms.
-# Recursive Doubling and Swing require power-of-two world_size.
-ALGOS_8=(
-  "recursive-doubling-latency"
-  "recursive-doubling-bandwidth"
-  "swing-latency"
-  "swing-bandwidth"
-)
-
-# Optional built-in baselines. Uncomment if needed.
-# ALGOS_9+=("builtin")
-# ALGOS_8+=("builtin")
-
 rm -f "${CSV_FILE}"
 
-echo "algo,world_size,hidden_dim,num_layers,model_label,total_params,grad_size_bytes,grad_size_mib,steps,batch_size,bucket_cap_mb,threads,repeat_id,total_training_time_sec,avg_step_time_ms,normalized_total_training_time_sec,normalized_avg_step_time_ms,parameter_max_diff" > "${CSV_FILE}"
+echo "algo,world_size,hidden_dim,num_layers,model_label,total_params,grad_size_bytes,grad_size_mib,steps,batch_size,bucket_cap_mb,threads,repeat_id,total_training_time_sec,avg_step_time_ms,parameter_max_diff" > "${CSV_FILE}"
 
 next_port() {
 python - <<'PY'
@@ -118,8 +108,6 @@ run_one() {
 
   local grad_size_bytes="NA"
   local grad_size_mib="NA"
-  local norm_total="NA"
-  local norm_avg="NA"
 
   if [[ "${total_params}" != "NA" ]]; then
     grad_size_bytes=$(( total_params * 4 ))
@@ -129,25 +117,26 @@ PY
 )
   fi
 
-  # Normalize 8-rank algorithms to 9 ranks using x 9/8.
-  # 9-rank algorithms keep raw values.
-  if [[ "${total_time}" != "NA" && "${avg_step}" != "NA" ]]; then
-    if [[ "${nproc}" == "8" ]]; then
-      norm_total=$(python - <<PY
-print(f"{float('${total_time}') * 9.0 / 8.0:.6f}")
-PY
-)
-      norm_avg=$(python - <<PY
-print(f"{float('${avg_step}') * 9.0 / 8.0:.6f}")
-PY
-)
-    else
-      norm_total="${total_time}"
-      norm_avg="${avg_step}"
-    fi
-  fi
+  echo "${algo},${nproc},${hidden_dim},${num_layers},${model_label},${total_params},${grad_size_bytes},${grad_size_mib},${STEPS},${BATCH_SIZE},${BUCKET_CAP_MB},${THREADS},${repeat_id},${total_time},${avg_step},${max_diff}" >> "${CSV_FILE}"
 
-  echo "${algo},${nproc},${hidden_dim},${num_layers},${model_label},${total_params},${grad_size_bytes},${grad_size_mib},${STEPS},${BATCH_SIZE},${BUCKET_CAP_MB},${THREADS},${repeat_id},${total_time},${avg_step},${norm_total},${norm_avg},${max_diff}" >> "${CSV_FILE}"
+  echo ""
+  echo "==================== FINISHED RESULT ===================="
+  echo "algo=${algo}"
+  echo "world_size=${nproc}"
+  echo "model=${model_label}"
+  echo "total_params=${total_params}"
+  echo "grad_size_mib=${grad_size_mib}"
+  echo "repeat=${repeat_id}"
+  echo "total_training_time_sec=${total_time}"
+  echo "avg_step_time_ms=${avg_step}"
+  echo "parameter_max_diff=${max_diff}"
+  echo "csv=${CSV_FILE}"
+  echo "========================================================="
+  echo ""
+
+  echo "Recent finished results:"
+  tail -n 10 "${CSV_FILE}"
+  echo ""
 }
 
 for repeat_id in $(seq 1 "${REPEATS}"); do
@@ -156,10 +145,6 @@ for repeat_id in $(seq 1 "${REPEATS}"); do
 
     for algo in "${ALGOS_9[@]}"; do
       run_one "${algo}" 9 "${hidden_dim}" "${num_layers}" "${model_label}" "${repeat_id}"
-    done
-
-    for algo in "${ALGOS_8[@]}"; do
-      run_one "${algo}" 8 "${hidden_dim}" "${num_layers}" "${model_label}" "${repeat_id}"
     done
   done
 done

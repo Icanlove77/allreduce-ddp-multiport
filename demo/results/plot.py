@@ -6,8 +6,8 @@ from pathlib import Path
 
 CSV_PATH = Path("training_completion_results.csv")
 
-# Use normalized time because 8-rank algorithms have already been normalized by 9/8.
-METRIC = "normalized_avg_step_time_ms"
+# All algorithms now run with the same world_size=9, so no normalization is needed.
+METRIC = "avg_step_time_ms"
 
 OUT_AVG_FIG = Path("relative_completion_mean.pdf")
 OUT_FAV_FIG = Path("relative_completion_best.pdf")
@@ -15,6 +15,7 @@ OUT_SUMMARY = Path("plot_summaries.csv")
 
 
 families = {
+    "BuiltIn": ["builtin"],
     "Ring": ["ring"],
     "RecDoub": [
         "recursive-doubling-latency",
@@ -48,6 +49,12 @@ def format_size(num_bytes: int) -> str:
 
 def load_data(csv_path: Path):
     df = pd.read_csv(csv_path)
+
+    if METRIC not in df.columns:
+        raise ValueError(
+            f"Metric column '{METRIC}' not found in CSV. "
+            f"Available columns: {list(df.columns)}"
+        )
 
     # Sort model configurations by estimated allreduce size.
     meta = (
@@ -85,8 +92,8 @@ def build_average_summary(df: pd.DataFrame, meta: pd.DataFrame, model_order):
             if sub.empty:
                 continue
 
-            if family == "Ring":
-                selected_algo = "ring"
+            if family in ["BuiltIn", "Ring"]:
+                selected_algo = algos[0]
                 selected_time = sub[METRIC].mean()
             else:
                 means = sub.groupby("algo")[METRIC].mean()
@@ -145,9 +152,9 @@ def build_trivance_favored_summary(df: pd.DataFrame, meta: pd.DataFrame, model_o
                 selected_time = best_by_repeat.min()
                 selected_algo = "trivance_best_repeat"
 
-            elif family == "Ring":
+            elif family in ["BuiltIn", "Ring"]:
                 selected_time = sub.groupby("repeat_id")[METRIC].max().max()
-                selected_algo = "ring_worst_repeat"
+                selected_algo = f"{family.lower()}_worst_repeat"
 
             else:
                 best_by_repeat = sub.groupby("repeat_id")[METRIC].min()
@@ -185,7 +192,7 @@ def build_trivance_favored_summary(df: pd.DataFrame, meta: pd.DataFrame, model_o
 
 def find_transition_points(df: pd.DataFrame, model_order):
     """
-    Find first model size where bandwidth version beats latency version,
+    Find first model size where bandwidth version beats latency version.
     """
     pairs = {
         "RecDoub": (
@@ -244,7 +251,6 @@ def add_trivance_transition_line(ax, transition_points, x_labels):
     if idx is None:
         return
 
-    # Vertical dashed line.
     ax.axvline(
         x=idx,
         linestyle=":",
@@ -253,18 +259,6 @@ def add_trivance_transition_line(ax, transition_points, x_labels):
         alpha=0.9,
         zorder=0,
     )
-
-    # # Hollow marker on the Trivance baseline y=0.
-    # ax.scatter(
-    #     [idx],
-    #     [0],
-    #     s=120,
-    #     facecolors="white",
-    #     edgecolors="0.25",
-    #     linewidths=2.2,
-    #     zorder=6,
-    # )
-
 
 
 def add_trivance_direction_annotation(ax):
@@ -289,7 +283,6 @@ def add_trivance_direction_annotation(ax):
     green = "green"
     red = "red"
 
-    # Upper green arrow.
     ax.annotate(
         "",
         xy=(x_arrow, 0.97),
@@ -306,7 +299,6 @@ def add_trivance_direction_annotation(ax):
         annotation_clip=False,
     )
 
-    # Lower red arrow.
     ax.annotate(
         "",
         xy=(x_arrow, 0.03),
@@ -357,9 +349,13 @@ def plot_summary(summary: pd.DataFrame, model_order, x_labels, transition_points
 
     fig, ax = plt.subplots(figsize=(11.2, 6.5))
 
-    plot_families = ["Ring", "RecDoub", "Swing", "Bruck"]
+    plot_families = ["BuiltIn", "Ring", "RecDoub", "Swing", "Bruck"]
 
     styles = {
+        "BuiltIn": {
+            "marker": "D",
+            "color": "#ff7f0e",
+        },
         "Ring": {
             "marker": "o",
             "color": "#1f77b4",
@@ -413,7 +409,6 @@ def plot_summary(summary: pd.DataFrame, model_order, x_labels, transition_points
                 zorder=7,
             )
 
-    # Baseline: same completion time as Trivance.
     ax.axhline(
         0,
         linestyle="--",
@@ -422,7 +417,6 @@ def plot_summary(summary: pd.DataFrame, model_order, x_labels, transition_points
         alpha=0.85,
     )
 
-    # Vertical dashed line for Trivance's transition point.
     add_trivance_transition_line(ax, transition_points, x_labels)
 
     ax.set_xticks(x)
@@ -504,7 +498,7 @@ def main():
     print(f"Saved: {OUT_FAV_FIG}")
     print(f"Saved: {OUT_SUMMARY}")
 
-    print("\nTransition points based on five-run means:")
+    print("\nTransition points based on run means:")
     for family, idx in transition_points.items():
         if idx is None:
             print(f"  {family}: no bandwidth-over-latency transition in this dataset")
