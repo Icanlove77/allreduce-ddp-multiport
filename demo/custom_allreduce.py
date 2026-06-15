@@ -1380,3 +1380,375 @@ def allreduce_sum_(x: torch.Tensor, algo: str) -> torch.Tensor:
         return trivance_bandwidth_allreduce_sum_(x)
     else:
         raise ValueError(f"Unknown all-reduce algorithm: {algo}")
+
+# ============================================================================
+# Special 16-rank Trivance adaptations
+# ============================================================================
+
+_TRIVANCE_N16_DISTANCES = [1, 3, 4]
+_TRIVANCE_N16_BANDWIDTH_SCHEDULE = [{(0, 1): [2, 3, 10, 11, 16, 20, 21, 28, 29],
+  (0, 15): [4, 5, 12, 13, 17, 22, 23, 30, 31],
+  (1, 0): [0, 1, 6, 7, 14, 15, 19, 24, 25],
+  (1, 2): [4, 5, 12, 13, 18, 22, 23, 30, 31],
+  (2, 1): [2, 3, 8, 9, 16, 17, 21, 26, 27],
+  (2, 3): [0, 1, 6, 7, 14, 15, 20, 24, 25],
+  (3, 2): [4, 5, 10, 11, 18, 19, 23, 28, 29],
+  (3, 4): [2, 3, 8, 9, 16, 17, 22, 26, 27],
+  (4, 3): [6, 7, 12, 13, 20, 21, 25, 30, 31],
+  (4, 5): [4, 5, 10, 11, 18, 19, 24, 28, 29],
+  (5, 4): [0, 1, 8, 9, 14, 15, 22, 23, 27],
+  (5, 6): [6, 7, 12, 13, 20, 21, 26, 30, 31],
+  (6, 5): [2, 3, 10, 11, 16, 17, 24, 25, 29],
+  (6, 7): [0, 1, 8, 9, 14, 15, 22, 23, 28],
+  (7, 6): [4, 5, 12, 13, 18, 19, 26, 27, 31],
+  (7, 8): [2, 3, 10, 11, 16, 17, 24, 25, 30],
+  (8, 7): [1, 6, 7, 14, 15, 20, 21, 28, 29],
+  (8, 9): [0, 4, 5, 12, 13, 18, 19, 26, 27],
+  (9, 8): [3, 8, 9, 16, 17, 22, 23, 30, 31],
+  (9, 10): [2, 6, 7, 14, 15, 20, 21, 28, 29],
+  (10, 9): [0, 1, 5, 10, 11, 18, 19, 24, 25],
+  (10, 11): [4, 8, 9, 16, 17, 22, 23, 30, 31],
+  (11, 10): [2, 3, 7, 12, 13, 20, 21, 26, 27],
+  (11, 12): [0, 1, 6, 10, 11, 18, 19, 24, 25],
+  (12, 11): [4, 5, 9, 14, 15, 22, 23, 28, 29],
+  (12, 13): [2, 3, 8, 12, 13, 20, 21, 26, 27],
+  (13, 12): [6, 7, 11, 16, 17, 24, 25, 30, 31],
+  (13, 14): [4, 5, 10, 14, 15, 22, 23, 28, 29],
+  (14, 13): [0, 1, 8, 9, 13, 18, 19, 26, 27],
+  (14, 15): [6, 7, 12, 16, 17, 24, 25, 30, 31],
+  (15, 0): [0, 1, 8, 9, 14, 18, 19, 26, 27],
+  (15, 14): [2, 3, 10, 11, 15, 20, 21, 28, 29]},
+ {(0, 3): [6, 7, 14, 15],
+  (0, 13): [18, 19, 26, 27],
+  (1, 4): [8, 9, 16, 17],
+  (1, 14): [20, 21, 28, 29],
+  (2, 5): [10, 11, 18, 19],
+  (2, 15): [22, 23, 30, 31],
+  (3, 0): [0, 1, 24, 25],
+  (3, 6): [12, 13, 20, 21],
+  (4, 1): [2, 3, 26, 27],
+  (4, 7): [14, 15, 22, 23],
+  (5, 2): [4, 5, 28, 29],
+  (5, 8): [16, 17, 24, 25],
+  (6, 3): [6, 7, 30, 31],
+  (6, 9): [18, 19, 26, 27],
+  (7, 4): [0, 1, 8, 9],
+  (7, 10): [20, 21, 28, 29],
+  (8, 5): [2, 3, 10, 11],
+  (8, 11): [22, 23, 30, 31],
+  (9, 6): [4, 5, 12, 13],
+  (9, 12): [0, 1, 24, 25],
+  (10, 7): [6, 7, 14, 15],
+  (10, 13): [2, 3, 26, 27],
+  (11, 8): [8, 9, 16, 17],
+  (11, 14): [4, 5, 28, 29],
+  (12, 9): [10, 11, 18, 19],
+  (12, 15): [6, 7, 30, 31],
+  (13, 0): [0, 1, 8, 9],
+  (13, 10): [12, 13, 20, 21],
+  (14, 1): [2, 3, 10, 11],
+  (14, 11): [14, 15, 22, 23],
+  (15, 2): [4, 5, 12, 13],
+  (15, 12): [16, 17, 24, 25]},
+ {(0, 4): [8, 9],
+  (0, 12): [24, 25],
+  (1, 5): [10, 11],
+  (1, 13): [26, 27],
+  (2, 6): [12, 13],
+  (2, 14): [28, 29],
+  (3, 7): [14, 15],
+  (3, 15): [30, 31],
+  (4, 0): [0, 1],
+  (4, 8): [16, 17],
+  (5, 1): [2, 3],
+  (5, 9): [18, 19],
+  (6, 2): [4, 5],
+  (6, 10): [20, 21],
+  (7, 3): [6, 7],
+  (7, 11): [22, 23],
+  (8, 4): [8, 9],
+  (8, 12): [24, 25],
+  (9, 5): [10, 11],
+  (9, 13): [26, 27],
+  (10, 6): [12, 13],
+  (10, 14): [28, 29],
+  (11, 7): [14, 15],
+  (11, 15): [30, 31],
+  (12, 0): [0, 1],
+  (12, 8): [16, 17],
+  (13, 1): [2, 3],
+  (13, 9): [18, 19],
+  (14, 2): [4, 5],
+  (14, 10): [20, 21],
+  (15, 3): [6, 7],
+  (15, 11): [22, 23]}]
+
+
+def _trivance_n16_peers(rank: int, step: int):
+    distance = _TRIVANCE_N16_DISTANCES[step]
+    return (rank - distance) % 16, (rank + distance) % 16
+
+
+def _trivance_n16_latency_allgather_sum_(x: torch.Tensor) -> torch.Tensor:
+    """
+    A naive latency implementation would overcount in the final step because the coverage sets overlap. To keep the result
+    correct, this implementation propagates one row per source rank together
+    with a source mask, deduplicates sources, and sums the 16 unique source
+    rows at the end.
+
+    This is for feasibility, not performance.
+    """
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    if world_size != 16:
+        raise ValueError(
+            f"This special Trivance latency path only supports world_size=16, got {world_size}."
+        )
+
+    original_shape = x.shape
+    work = x.contiguous().view(-1)
+    numel = work.numel()
+
+    # state[src] stores the contribution from source rank src if mask[src] == 1.
+    state = torch.zeros((16, numel), dtype=work.dtype, device=work.device)
+    state[rank].copy_(work)
+
+    mask = torch.zeros(16, dtype=torch.bool, device=work.device)
+    mask[rank] = True
+
+    # Pack mask and rows into a single tensor so each peer exchange uses one
+    # P2P message. This avoids tag/order issues with multiple small messages.
+    payload_width = max(numel, 16)
+
+    for step, distance in enumerate(_TRIVANCE_N16_DISTANCES):
+        left_peer = (rank - distance) % 16
+        right_peer = (rank + distance) % 16
+
+        payload = torch.zeros((17, payload_width), dtype=work.dtype, device=work.device)
+        payload[0, :16].copy_(mask.to(dtype=work.dtype))
+        payload[1:17, :numel].copy_(state)
+
+        send_left = payload.contiguous()
+        send_right = payload.contiguous().clone()
+        recv_left = torch.empty_like(payload)
+        recv_right = torch.empty_like(payload)
+
+        ops = [
+            dist.P2POp(dist.isend, send_left, left_peer),
+            dist.P2POp(dist.irecv, recv_left, left_peer),
+            dist.P2POp(dist.isend, send_right, right_peer),
+            dist.P2POp(dist.irecv, recv_right, right_peer),
+        ]
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+
+        for recv_payload in (recv_left, recv_right):
+            recv_mask = recv_payload[0, :16] != 0
+            recv_state = recv_payload[1:17, :numel]
+            for src in range(16):
+                if bool(recv_mask[src].item()) and not bool(mask[src].item()):
+                    state[src].copy_(recv_state[src])
+                    mask[src] = True
+
+    if int(mask.sum().item()) != 16:
+        raise RuntimeError(
+            f"Trivance n=16 latency propagation incomplete on rank {rank}: "
+            f"got {int(mask.sum().item())} sources."
+        )
+
+    result = state.sum(dim=0)
+    work.copy_(result)
+    x.copy_(work.view(original_shape))
+    return x
+
+def trivance_latency_allreduce_sum_(x: torch.Tensor) -> torch.Tensor:
+    """
+    Trivance latency AllReduce.
+
+    Supports:
+    - world_size = 3^k: original Trivance latency schedule.
+    - world_size = 16: special [1, 3, 4] source-propagation adaptation.
+    """
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+
+    if world_size == 1:
+        return x
+
+    if world_size == 16:
+        return _trivance_n16_latency_allgather_sum_(x)
+
+    if not _is_power_of(world_size, 3):
+        raise ValueError(
+            f"Trivance latency version requires world_size=3^k, or special world_size=16; "
+            f"got world_size={world_size}."
+        )
+
+    steps = _log_power(world_size, 3)
+    original_shape = x.shape
+    work = x.contiguous().view(-1)
+    recv_left = torch.empty_like(work)
+    recv_right = torch.empty_like(work)
+
+    for step in range(steps):
+        left_peer, right_peer = _trivance_peers(rank, step, world_size)
+        if left_peer == right_peer:
+            raise RuntimeError("Invalid Trivance peer selection.")
+
+        send_left = work.contiguous()
+        send_right = work.contiguous()
+        ops = [
+            dist.P2POp(dist.isend, send_left, left_peer),
+            dist.P2POp(dist.irecv, recv_left, left_peer),
+            dist.P2POp(dist.isend, send_right, right_peer),
+            dist.P2POp(dist.irecv, recv_right, right_peer),
+        ]
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+
+        work.add_(recv_left)
+        work.add_(recv_right)
+
+    x.copy_(work.view(original_shape))
+    return x
+
+
+def trivance_bandwidth_allreduce_sum_(x: torch.Tensor) -> torch.Tensor:
+    """
+    Trivance bandwidth AllReduce.
+
+    Supports:
+    - world_size = 3^k: original Trivance-B schedule.
+    - world_size = 16: special schedule from n16-propagation.txt.
+
+    For world_size=16, the logical 16 blocks are split into 32 half-blocks.
+    A token like 08(1) maps to the first half of block 8, while 08 maps to
+    both halves of block 8. 
+    """
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+
+    if world_size == 1:
+        return x
+
+    if world_size == 16:
+        original_shape, flat, original_numel, work, chunks = _prepare_work_buffer(x, 32)
+
+        # Phase 1: Reduce-Scatter.
+        for step, schedule in enumerate(_TRIVANCE_N16_BANDWIDTH_SCHEDULE):
+            outgoing = sorted([(dst, indices) for (src, dst), indices in schedule.items() if src == rank])
+            incoming = sorted([(src, indices) for (src, dst), indices in schedule.items() if dst == rank])
+
+            if len(outgoing) != 2 or len(incoming) != 2:
+                raise RuntimeError(f"Invalid n=16 Trivance schedule at step {step}, rank {rank}.")
+
+            recv_buffers = []
+            ops = []
+            for dst, indices in outgoing:
+                ops.append(dist.P2POp(dist.isend, _pack_chunks(chunks, indices), dst))
+            for src, indices in incoming:
+                recv_buf = _recv_buffer_like(chunks, indices)
+                recv_buffers.append((indices, recv_buf))
+                ops.append(dist.P2POp(dist.irecv, recv_buf, src))
+
+            reqs = dist.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()
+
+            for indices, recv_buf in recv_buffers:
+                _add_packed_to_chunks(chunks, indices, recv_buf)
+
+        # Phase 2: AllGather.
+        for step in reversed(range(len(_TRIVANCE_N16_BANDWIDTH_SCHEDULE))):
+            schedule = _TRIVANCE_N16_BANDWIDTH_SCHEDULE[step]
+
+            # Original incoming edges src -> rank become outgoing rank -> src.
+            outgoing = sorted([(src, indices) for (src, dst), indices in schedule.items() if dst == rank])
+            # Original outgoing edges rank -> dst become incoming dst -> rank.
+            incoming = sorted([(dst, indices) for (src, dst), indices in schedule.items() if src == rank])
+
+            if len(outgoing) != 2 or len(incoming) != 2:
+                raise RuntimeError(f"Invalid n=16 Trivance reverse schedule at step {step}, rank {rank}.")
+
+            recv_buffers = []
+            ops = []
+            for dst, indices in outgoing:
+                ops.append(dist.P2POp(dist.isend, _pack_chunks(chunks, indices), dst))
+            for src, indices in incoming:
+                recv_buf = _recv_buffer_like(chunks, indices)
+                recv_buffers.append((indices, recv_buf))
+                ops.append(dist.P2POp(dist.irecv, recv_buf, src))
+
+            reqs = dist.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()
+
+            for indices, recv_buf in recv_buffers:
+                _copy_packed_to_chunks(chunks, indices, recv_buf)
+
+        return _finish_work_buffer(x, original_shape, flat, original_numel, work)
+
+    if not _is_power_of(world_size, 3):
+        raise ValueError(
+            f"Trivance bandwidth version requires world_size=3^k, or special world_size=16; "
+            f"got world_size={world_size}."
+        )
+
+    steps = _log_power(world_size, 3)
+    original_shape, flat, original_numel, work, chunks = _prepare_work_buffer(x, world_size)
+
+    for step in range(steps):
+        left_peer, right_peer = _trivance_peers(rank, step, world_size)
+        if left_peer == right_peer:
+            raise RuntimeError("Invalid Trivance peer selection.")
+
+        local_indices = _trivance_subtree_indices(rank, step + 1, world_size, steps)
+        send_left_indices = _trivance_subtree_indices(left_peer, step + 1, world_size, steps)
+        send_right_indices = _trivance_subtree_indices(right_peer, step + 1, world_size, steps)
+
+        send_left = _pack_chunks(chunks, send_left_indices)
+        send_right = _pack_chunks(chunks, send_right_indices)
+        recv_left = _recv_buffer_like(chunks, local_indices)
+        recv_right = _recv_buffer_like(chunks, local_indices)
+
+        ops = [
+            dist.P2POp(dist.isend, send_left, left_peer),
+            dist.P2POp(dist.irecv, recv_left, left_peer),
+            dist.P2POp(dist.isend, send_right, right_peer),
+            dist.P2POp(dist.irecv, recv_right, right_peer),
+        ]
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+
+        _add_packed_to_chunks(chunks, local_indices, recv_left)
+        _add_packed_to_chunks(chunks, local_indices, recv_right)
+
+    for step in reversed(range(steps)):
+        left_peer, right_peer = _trivance_peers(rank, step, world_size)
+
+        local_indices = _trivance_subtree_indices(rank, step + 1, world_size, steps)
+        recv_left_indices = _trivance_subtree_indices(left_peer, step + 1, world_size, steps)
+        recv_right_indices = _trivance_subtree_indices(right_peer, step + 1, world_size, steps)
+
+        send_left = _pack_chunks(chunks, local_indices)
+        send_right = _pack_chunks(chunks, local_indices)
+        recv_left = _recv_buffer_like(chunks, recv_left_indices)
+        recv_right = _recv_buffer_like(chunks, recv_right_indices)
+
+        ops = [
+            dist.P2POp(dist.isend, send_left, left_peer),
+            dist.P2POp(dist.irecv, recv_left, left_peer),
+            dist.P2POp(dist.isend, send_right, right_peer),
+            dist.P2POp(dist.irecv, recv_right, right_peer),
+        ]
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+
+        _copy_packed_to_chunks(chunks, recv_left_indices, recv_left)
+        _copy_packed_to_chunks(chunks, recv_right_indices, recv_right)
+
+    return _finish_work_buffer(x, original_shape, flat, original_numel, work)

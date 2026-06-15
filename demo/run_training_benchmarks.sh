@@ -3,6 +3,10 @@ set -euo pipefail
 
 export GLOO_SOCKET_IFNAME=lo
 export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
 
 CSV_FILE="training_completion_results.csv"
 LOG_DIR="logs_training_bench"
@@ -17,6 +21,7 @@ THREADS=1
 BUCKET_CAP_MB=512
 
 REPEATS=5
+NPROC=16
 
 # Model sizes from small to large.
 # Format: "hidden_dim num_layers label"
@@ -30,21 +35,11 @@ MODEL_CONFIGS=(
   "1024 4 h1024_l4"
 )
 
-# MODEL_CONFIGS+=(
-#   "2048 2 h2048_l2"
-# )
-
-# All algorithms now run with 9 ranks.
-# RD and Swing should already support non-power-of-two world_size after the 9-rank adaptation.
-ALGOS_9=(
-  "builtin"
+# Only test Ring, Recursive Doubling, and Trivance with 16 ranks.
+ALGOS_16=(
   "ring"
   "recursive-doubling-latency"
   "recursive-doubling-bandwidth"
-  "swing-latency"
-  "swing-bandwidth"
-  "bruck-latency"
-  "bruck-bandwidth"
   "trivance-latency"
   "trivance-bandwidth"
 )
@@ -57,7 +52,7 @@ next_port() {
 python - <<'PY'
 import socket
 s = socket.socket()
-s.bind(("", 0))
+s.bind(("127.0.0.1", 0))
 print(s.getsockname()[1])
 s.close()
 PY
@@ -80,7 +75,6 @@ run_one() {
   echo "Running algo=${algo}, nproc=${nproc}, model=${model_label}, repeat=${repeat_id}, port=${port}"
   echo "============================================================"
 
-  OMP_NUM_THREADS=${THREADS} \
   torchrun \
     --nnodes=1 \
     --nproc_per_node="${nproc}" \
@@ -143,8 +137,8 @@ for repeat_id in $(seq 1 "${REPEATS}"); do
   for config in "${MODEL_CONFIGS[@]}"; do
     read -r hidden_dim num_layers model_label <<< "${config}"
 
-    for algo in "${ALGOS_9[@]}"; do
-      run_one "${algo}" 9 "${hidden_dim}" "${num_layers}" "${model_label}" "${repeat_id}"
+    for algo in "${ALGOS_16[@]}"; do
+      run_one "${algo}" "${NPROC}" "${hidden_dim}" "${num_layers}" "${model_label}" "${repeat_id}"
     done
   done
 done
