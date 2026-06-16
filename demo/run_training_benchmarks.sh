@@ -7,6 +7,7 @@ export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
+export MALLOC_ARENA_MAX=2
 
 CSV_FILE="training_completion_results.csv"
 LOG_DIR="logs_training_bench"
@@ -16,8 +17,8 @@ STEPS=300
 BATCH_SIZE=16
 THREADS=1
 
-# Make bucket large enough so small/medium models are usually kept in one DDP bucket.
-# This makes the gradient communication size roughly equal to model parameter size.
+# Keep this large if you want one large DDP bucket for most model sizes.
+# If Trivance 16nodes version becomes too memory-heavy, try BUCKET_CAP_MB=1 or 4.
 BUCKET_CAP_MB=512
 
 REPEATS=5
@@ -75,6 +76,9 @@ run_one() {
   echo "Running algo=${algo}, nproc=${nproc}, model=${model_label}, repeat=${repeat_id}, port=${port}"
   echo "============================================================"
 
+  # Do not let a torchrun cleanup SIGABRT stop the whole benchmark immediately.
+  # Some runs may print valid metrics and then return non-zero during process cleanup.
+  set +e
   torchrun \
     --nnodes=1 \
     --nproc_per_node="${nproc}" \
@@ -89,6 +93,8 @@ run_one() {
       --bucket-cap-mb "${BUCKET_CAP_MB}" \
       --threads "${THREADS}" \
     2>&1 | tee "${log_file}"
+  local run_status=${PIPESTATUS[0]}
+  set -e
 
   local total_params
   local total_time
@@ -111,6 +117,17 @@ PY
 )
   fi
 
+  local accepted="no"
+  if [[ "${total_time}" != "NA" && "${avg_step}" != "NA" && "${max_diff}" != "NA" ]]; then
+    accepted="yes"
+  fi
+
+  if [[ "${run_status}" -ne 0 && "${accepted}" == "yes" ]]; then
+    echo "WARNING: torchrun exited with status ${run_status}, but metrics were found. Treating this run as completed."
+  elif [[ "${run_status}" -ne 0 && "${accepted}" != "yes" ]]; then
+    echo "ERROR: torchrun exited with status ${run_status} before producing complete metrics. Recording NA and continuing."
+  fi
+
   echo "${algo},${nproc},${hidden_dim},${num_layers},${model_label},${total_params},${grad_size_bytes},${grad_size_mib},${STEPS},${BATCH_SIZE},${BUCKET_CAP_MB},${THREADS},${repeat_id},${total_time},${avg_step},${max_diff}" >> "${CSV_FILE}"
 
   echo ""
@@ -124,6 +141,7 @@ PY
   echo "total_training_time_sec=${total_time}"
   echo "avg_step_time_ms=${avg_step}"
   echo "parameter_max_diff=${max_diff}"
+
   echo "csv=${CSV_FILE}"
   echo "========================================================="
   echo ""
@@ -131,6 +149,9 @@ PY
   echo "Recent finished results:"
   tail -n 10 "${CSV_FILE}"
   echo ""
+
+  # Give Gloo/torchrun a short pause to release local resources cleanly.
+  sleep 2
 }
 
 for repeat_id in $(seq 1 "${REPEATS}"); do
