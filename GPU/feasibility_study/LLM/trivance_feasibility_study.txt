@@ -1,0 +1,118 @@
+NCCL version 2.27.3+cuda12.9
+===== GPT-2 Chat DDP Config =====
+algo=trivance-bandwidth
+model_name=openai-community/gpt2
+dataset_name=roskoN/dailydialog
+dataset_config=
+dataset_split=train
+trust_remote_code=False
+local_jsonl=
+system_prompt=You are a helpful assistant.
+max_samples=20000
+min_chars=8
+block_size=256
+steps=1000
+batch_size=2
+lr=5e-05
+weight_decay=0.01
+bucket_cap_mb=25.0
+threads=1
+dtype=fp32
+gradient_checkpointing=False
+log_interval=20
+full_param_check=False
+save_model=True
+output_dir=/workspace/gpt2_chat_trivance_1000
+preview_prompt=User: Hello, how are you?
+Assistant:
+world_size=3
+=================================
+Loading dataset: roskoN/dailydialog/:train
+training_text_samples=76052
+example_training_text_begin
+System: You are a helpful assistant.\nUser: Say , Jim , how about going for a few beers after dinner ?\nAssistant: You know that is tempting but is really not good for our fitness .<|endoftext|>
+example_training_text_end
+total_params=124439808
+trainable_params=124439808
+dataset_sequences=76052
+`loss_type=None` was set in the config but it is unrecognized. Using the default loss: `ForCausalLMLoss`.
+`loss_type=None` was set in the config but it is unrecognized. Using the default loss: `ForCausalLMLoss`.
+`loss_type=None` was set in the config but it is unrecognized. Using the default loss: `ForCausalLMLoss`.
+step=00000 loss_avg=4.353952 algo=trivance-bandwidth
+step=00020 loss_avg=2.334584 algo=trivance-bandwidth
+step=00040 loss_avg=2.222958 algo=trivance-bandwidth
+step=00060 loss_avg=2.402829 algo=trivance-bandwidth
+step=00080 loss_avg=2.191743 algo=trivance-bandwidth
+step=00100 loss_avg=1.886842 algo=trivance-bandwidth
+step=00120 loss_avg=1.811457 algo=trivance-bandwidth
+step=00140 loss_avg=1.803842 algo=trivance-bandwidth
+step=00160 loss_avg=2.447349 algo=trivance-bandwidth
+step=00180 loss_avg=1.953918 algo=trivance-bandwidth
+step=00200 loss_avg=2.037599 algo=trivance-bandwidth
+step=00220 loss_avg=1.849747 algo=trivance-bandwidth
+step=00240 loss_avg=2.397190 algo=trivance-bandwidth
+step=00260 loss_avg=1.981739 algo=trivance-bandwidth
+step=00280 loss_avg=2.036942 algo=trivance-bandwidth
+step=00300 loss_avg=2.074512 algo=trivance-bandwidth
+step=00320 loss_avg=2.190692 algo=trivance-bandwidth
+step=00340 loss_avg=2.022685 algo=trivance-bandwidth
+step=00360 loss_avg=1.870488 algo=trivance-bandwidth
+step=00380 loss_avg=2.110854 algo=trivance-bandwidth
+step=00400 loss_avg=2.060852 algo=trivance-bandwidth
+step=00420 loss_avg=2.304308 algo=trivance-bandwidth
+step=00440 loss_avg=2.070359 algo=trivance-bandwidth
+step=00460 loss_avg=1.946672 algo=trivance-bandwidth
+step=00480 loss_avg=1.897616 algo=trivance-bandwidth
+step=00500 loss_avg=1.862016 algo=trivance-bandwidth
+step=00520 loss_avg=1.848719 algo=trivance-bandwidth
+step=00540 loss_avg=2.414617 algo=trivance-bandwidth
+step=00560 loss_avg=2.021425 algo=trivance-bandwidth
+step=00580 loss_avg=2.076129 algo=trivance-bandwidth
+step=00600 loss_avg=2.457551 algo=trivance-bandwidth
+step=00620 loss_avg=2.040266 algo=trivance-bandwidth
+step=00640 loss_avg=2.055278 algo=trivance-bandwidth
+step=00660 loss_avg=1.882900 algo=trivance-bandwidth
+step=00680 loss_avg=1.730176 algo=trivance-bandwidth
+step=00700 loss_avg=2.208627 algo=trivance-bandwidth
+step=00720 loss_avg=2.339806 algo=trivance-bandwidth
+step=00740 loss_avg=2.171504 algo=trivance-bandwidth
+step=00760 loss_avg=2.294905 algo=trivance-bandwidth
+step=00780 loss_avg=2.213645 algo=trivance-bandwidth
+step=00800 loss_avg=1.966937 algo=trivance-bandwidth
+step=00820 loss_avg=1.680841 algo=trivance-bandwidth
+step=00840 loss_avg=1.811020 algo=trivance-bandwidth
+step=00860 loss_avg=2.126356 algo=trivance-bandwidth
+step=00880 loss_avg=2.048110 algo=trivance-bandwidth
+step=00900 loss_avg=2.292396 algo=trivance-bandwidth
+step=00920 loss_avg=1.607367 algo=trivance-bandwidth
+step=00940 loss_avg=2.129210 algo=trivance-bandwidth
+step=00960 loss_avg=1.908716 algo=trivance-bandwidth
+step=00980 loss_avg=1.685656 algo=trivance-bandwidth
+hook_calls_per_rank=[12988, 12988, 12988]
+total_training_time_sec=69.536
+avg_step_time_ms=69.536
+parameter_checksum_max_diff_across_ranks=0.000000000000e+00
+parameter_checksum_rank0=[-79384.93218034506, 2263798.0507623553, 12706062.32489109, 124439808.0]
+generation_preview_begin
+User: Hello, how are you?
+Assistant: My name is Sam . I am very new to the company and it's a surprise that my name doesn't come up in our company's email list .
+Customer : What are your interests here ?
+generation_preview_end
+saved_model_dir=/workspace/gpt2_chat_trivance_1000
+root@ff08acfb389e:/# CUDA_VISIBLE_DEVICES=0 python chat_with_saved_gpt2.py --model-dir /workspace/gpt2_chat_trivance_1000 --temperature 0.8 --top-p 0.9 --max-new-tokens 120
+Loaded model: /workspace/gpt2_chat_trivance_1000
+Type 'exit' or 'quit' to stop.
+
+You: Hi,introduce yourself!
+GPT-2: I'm Tom .
+
+You: I'm a little upset today, what should I do
+GPT-2: Well , what should you do ?
+
+You: let's grab some beers?
+GPT-2: We can't afford to go out every day !
+
+You: I feel tired today
+GPT-2: Well that would be nice if we could have a break from the work in order not waste our time with coffee and reading too much about it at nighttime .
+
+You: exit
