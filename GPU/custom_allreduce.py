@@ -624,6 +624,90 @@ def ring_allreduce_sum_(x: torch.Tensor) -> torch.Tensor:
     return _finish_work_buffer(x, original_shape, flat, original_numel, work)
 
 
+def bidirectional_ring_allreduce_sum_(x: torch.Tensor) -> torch.Tensor:
+    """
+    Bidirectional Ring AllReduce for odd ring sizes n = 2d + 1.
+
+    Reduce-Scatter step k sends:
+        block (rank - d + k) mod n to the left neighbor
+        block (rank + d - k) mod n to the right neighbor
+
+    AllGather step k sends:
+        block (rank + k) mod n to the left neighbor
+        block (rank - k) mod n to the right neighbor
+
+    """
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+
+    if world_size == 1:
+        return x
+
+    if world_size % 2 == 0:
+        raise ValueError(
+            "Bidirectional Ring requires odd world_size n=2d+1. "
+            "On an 8-GPU RunPod, use --nproc_per_node=7 for this algorithm."
+        )
+
+    d = (world_size - 1) // 2
+
+    original_shape, flat, original_numel, work, chunks = _prepare_work_buffer(
+        x, world_size
+    )
+
+    left = (rank - 1 + world_size) % world_size
+    right = (rank + 1) % world_size
+
+    # Phase 1: Bidirectional Reduce-Scatter.
+    for step in range(d):
+        send_left_idx = (rank - d + step) % world_size
+        send_right_idx = (rank + d - step) % world_size
+
+        recv_from_right_idx = (rank - d + step + 1) % world_size
+        recv_from_left_idx = (rank + d - step - 1) % world_size
+
+        send_left = chunks[send_left_idx].contiguous()
+        send_right = chunks[send_right_idx].contiguous()
+        recv_from_right = torch.empty_like(chunks[0])
+        recv_from_left = torch.empty_like(chunks[0])
+
+        ops = [
+            dist.P2POp(dist.isend, send_left, left),
+            dist.P2POp(dist.irecv, recv_from_right, right),
+            dist.P2POp(dist.isend, send_right, right),
+            dist.P2POp(dist.irecv, recv_from_left, left),
+        ]
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+
+        chunks[recv_from_right_idx].add_(recv_from_right)
+        chunks[recv_from_left_idx].add_(recv_from_left)
+
+    # Phase 2: Bidirectional AllGather.
+    for step in range(d):
+        send_left_idx = (rank + step) % world_size
+        send_right_idx = (rank - step) % world_size
+
+        recv_from_right_idx = (rank + step + 1) % world_size
+        recv_from_left_idx = (rank - step - 1) % world_size
+
+        send_left = chunks[send_left_idx].contiguous()
+        send_right = chunks[send_right_idx].contiguous()
+
+        ops = [
+            dist.P2POp(dist.isend, send_left, left),
+            dist.P2POp(dist.irecv, chunks[recv_from_right_idx], right),
+            dist.P2POp(dist.isend, send_right, right),
+            dist.P2POp(dist.irecv, chunks[recv_from_left_idx], left),
+        ]
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
+
+    return _finish_work_buffer(x, original_shape, flat, original_numel, work)
+
+
 def recursive_doubling_latency_allreduce_sum_(x: torch.Tensor) -> torch.Tensor:
     """
     Recursive Doubling latency AllReduce.
@@ -1078,6 +1162,8 @@ def allreduce_sum_(x: torch.Tensor, algo: str) -> torch.Tensor:
         return builtin_allreduce_sum_(x)
     elif algo == "ring":
         return ring_allreduce_sum_(x)
+    elif algo in ("bidirectional-ring", "bidir-ring", "bi-ring"):
+        return bidirectional_ring_allreduce_sum_(x)
     elif algo == "recursive-doubling-latency":
         return recursive_doubling_latency_allreduce_sum_(x)
     elif algo == "recursive-doubling-bandwidth":

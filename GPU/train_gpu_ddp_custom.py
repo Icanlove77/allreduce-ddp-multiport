@@ -147,6 +147,7 @@ def main():
         choices=[
             "builtin",
             "ring",
+            "bidirectional-ring",
             "recursive-doubling-latency",
             "recursive-doubling-bandwidth",
             "swing-latency",
