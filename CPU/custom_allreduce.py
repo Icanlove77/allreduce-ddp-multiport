@@ -1,6 +1,22 @@
 import math
+import threading
 import torch
 import torch.distributed as dist
+
+
+_BIDIRECTIONAL_RING_GROUPS = {}
+
+
+def _get_bidirectional_ring_groups(world_size: int):
+    groups = _BIDIRECTIONAL_RING_GROUPS.get(world_size)
+    if groups is None:
+        ranks = list(range(world_size))
+        groups = (
+            dist.new_group(ranks=ranks),
+            dist.new_group(ranks=ranks),
+        )
+        _BIDIRECTIONAL_RING_GROUPS[world_size] = groups
+    return groups
 
 
 def _is_power_of(n: int, base: int) -> bool:
@@ -864,6 +880,139 @@ def ring_allreduce_sum_(x: torch.Tensor) -> torch.Tensor:
     return _finish_work_buffer(x, original_shape, flat, original_numel, work)
 
 
+def bidirectional_ring_allreduce_sum_(x: torch.Tensor) -> torch.Tensor:
+    """
+    Bidirectional Ring AllReduce for odd ring sizes n = 2d + 1.
+
+    The two directions are independent pipelines. 
+    """
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+
+    if world_size == 1:
+        return x
+
+    if world_size % 2 == 0:
+        raise ValueError(
+            f"Bidirectional Ring requires odd world_size n=2d+1, got world_size={world_size}."
+        )
+
+    d = (world_size - 1) // 2
+
+    original_shape, flat, original_numel, work, chunks = _prepare_work_buffer(
+        x, world_size
+    )
+
+    left = (rank - 1 + world_size) % world_size
+    right = (rank + 1) % world_size
+    left_group, right_group = _get_bidirectional_ring_groups(world_size)
+
+    def run_workers(*workers):
+        errors = []
+
+        def wrapped(worker):
+            try:
+                worker()
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=wrapped, args=(worker,)) for worker in workers]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        if errors:
+            raise errors[0]
+
+    final_reduce_parts = {"from_right": None, "from_left": None}
+
+    def reduce_scatter_left_direction():
+        # Partial reductions move from right to left.
+        for step in range(d):
+            send_idx = (rank - d + step) % world_size
+            recv_idx = (rank - d + step + 1) % world_size
+
+            send_buf = chunks[send_idx].contiguous()
+            recv_buf = torch.empty_like(chunks[0])
+
+            ops = [
+                dist.P2POp(dist.isend, send_buf, left, group=left_group),
+                dist.P2POp(dist.irecv, recv_buf, right, group=left_group),
+            ]
+            reqs = dist.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()
+
+            if step == d - 1:
+                final_reduce_parts["from_right"] = recv_buf
+            else:
+                chunks[recv_idx].add_(recv_buf)
+
+    def reduce_scatter_right_direction():
+        # Partial reductions move from left to right.
+        for step in range(d):
+            send_idx = (rank + d - step) % world_size
+            recv_idx = (rank + d - step - 1) % world_size
+
+            send_buf = chunks[send_idx].contiguous()
+            recv_buf = torch.empty_like(chunks[0])
+
+            ops = [
+                dist.P2POp(dist.isend, send_buf, right, group=right_group),
+                dist.P2POp(dist.irecv, recv_buf, left, group=right_group),
+            ]
+            reqs = dist.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()
+
+            if step == d - 1:
+                final_reduce_parts["from_left"] = recv_buf
+            else:
+                chunks[recv_idx].add_(recv_buf)
+
+    run_workers(reduce_scatter_left_direction, reduce_scatter_right_direction)
+
+    if final_reduce_parts["from_right"] is None or final_reduce_parts["from_left"] is None:
+        raise RuntimeError("Bidirectional ring Reduce-Scatter did not receive both final partial reductions.")
+
+    chunks[rank].add_(final_reduce_parts["from_right"])
+    chunks[rank].add_(final_reduce_parts["from_left"])
+
+    def allgather_left_direction():
+        # Reduced blocks move from right to left.
+        for step in range(d):
+            send_idx = (rank + step) % world_size
+            recv_idx = (rank + step + 1) % world_size
+
+            send_buf = chunks[send_idx].contiguous()
+            ops = [
+                dist.P2POp(dist.isend, send_buf, left, group=left_group),
+                dist.P2POp(dist.irecv, chunks[recv_idx], right, group=left_group),
+            ]
+            reqs = dist.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()
+
+    def allgather_right_direction():
+        # Reduced blocks move from left to right.
+        for step in range(d):
+            send_idx = (rank - step) % world_size
+            recv_idx = (rank - step - 1) % world_size
+
+            send_buf = chunks[send_idx].contiguous()
+            ops = [
+                dist.P2POp(dist.isend, send_buf, right, group=right_group),
+                dist.P2POp(dist.irecv, chunks[recv_idx], left, group=right_group),
+            ]
+            reqs = dist.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()
+
+    run_workers(allgather_left_direction, allgather_right_direction)
+
+    return _finish_work_buffer(x, original_shape, flat, original_numel, work)
+
+
 def recursive_doubling_latency_allreduce_sum_(x: torch.Tensor) -> torch.Tensor:
     """
     Recursive Doubling latency AllReduce.
@@ -1362,6 +1511,8 @@ def allreduce_sum_(x: torch.Tensor, algo: str) -> torch.Tensor:
         return builtin_allreduce_sum_(x)
     elif algo == "ring":
         return ring_allreduce_sum_(x)
+    elif algo in ("bidirectional-ring", "bidir-ring", "bi-ring"):
+        return bidirectional_ring_allreduce_sum_(x)
     elif algo == "recursive-doubling-latency":
         return recursive_doubling_latency_allreduce_sum_(x)
     elif algo == "recursive-doubling-bandwidth":
